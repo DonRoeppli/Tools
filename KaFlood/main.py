@@ -23,24 +23,38 @@ def worker_process(pin: int, name_prefix: str, start_index: int,
                    max_concurrent: int, spawn_delay: float,
                    q: multiprocessing.Queue):
 
-    async def run_bot(name: str) -> None:
+    async def run_bot(name: str, counter: int) -> None:
         joined = False
 
         async def on_event(event: str, data: dict):
             nonlocal joined
             if event == "login_response":
+                if joined:
+                    return
                 if data.get("error"):
-                    q.put(("rejected", data.get("description", data["error"])))
+                    desc = data.get("description", data["error"])
+                    if "Duplicate" in desc:
+                        pass
+                    else:
+                        q.put(("rejected", desc))
                 else:
                     joined = True
-                    q.put(("joined", name))
+                    actual_name = data.get("name", name)
+                    q.put(("joined", actual_name))
 
         client = KahootClient(on_event=on_event)
-        try:
-            await client.join(pin, name)
-        except Exception as e:
-            if not joined:
-                q.put(("error", str(e)))
+        for attempt in range(3):
+            joined = False
+            try:
+                await client.join(pin, name)
+                break
+            except Exception as e:
+                if not joined:
+                    if attempt == 2:
+                        q.put(("error", f"{type(e).__name__}: {e}" or type(e).__name__))
+                    else:
+                        await asyncio.sleep(1 + attempt)
+
         await asyncio.sleep(max(spawn_delay, 0.5))
 
     async def main():
@@ -48,7 +62,7 @@ def worker_process(pin: int, name_prefix: str, start_index: int,
         tasks: set[asyncio.Task] = set()
 
         for _ in range(max_concurrent):
-            t = asyncio.create_task(run_bot(f"{name_prefix}{counter}"))
+            t = asyncio.create_task(run_bot(f"{name_prefix}{counter}", counter))
             tasks.add(t)
             counter += 1
             await asyncio.sleep(spawn_delay)
@@ -56,7 +70,7 @@ def worker_process(pin: int, name_prefix: str, start_index: int,
         while True:
             done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for _ in done:
-                t = asyncio.create_task(run_bot(f"{name_prefix}{counter}"))
+                t = asyncio.create_task(run_bot(f"{name_prefix}{counter}", counter))
                 tasks.add(t)
                 counter += 1
 
@@ -76,7 +90,6 @@ class KahootApp(ctk.CTk):
         self._processes: list[multiprocessing.Process] = []
         self._q: multiprocessing.Queue = multiprocessing.Queue()
 
-        # Stats
         self._stat_joined   = 0
         self._stat_rejected = 0
         self._stat_errors   = 0
@@ -85,8 +98,7 @@ class KahootApp(ctk.CTk):
         self._name_entry: ctk.CTkEntry
         self._proc_var:   ctk.StringVar
         self._conc_var:   ctk.StringVar
-        self._delay_var:  ctk.StringVar
-        
+
         self._stat_proc_lbl:     ctk.CTkLabel
         self._stat_joined_lbl:   ctk.CTkLabel
         self._stat_rejected_lbl: ctk.CTkLabel
@@ -117,9 +129,8 @@ class KahootApp(ctk.CTk):
             setattr(self, f"_{attr}_entry", entry)
 
         for label, attr, default in [
-            ("Prozesse",          "_proc_var",  "2"),
-            ("Concurrent / Proc", "_conc_var",  "5"),
-            ("Spawn-Delay (s)",   "_delay_var", "0.3"),
+            ("Prozesse",          "_proc_var", "5"),
+            ("Concurrent / Proc", "_conc_var", "20"),
         ]:
             row = ctk.CTkFrame(form, fg_color="transparent")
             row.pack(fill="x", padx=16, pady=(10, 0))
@@ -131,6 +142,24 @@ class KahootApp(ctk.CTk):
                          fg_color="#0F3460", border_color="#0F3460",
                          text_color="white", font=ctk.CTkFont("Segoe UI", 13),
                          justify="center").pack(side="left")
+
+        # ── Spawn-Delay Slider ────────────────────────────────────────────────
+        delay_row = ctk.CTkFrame(form, fg_color="transparent")
+        delay_row.pack(fill="x", padx=16, pady=(10, 0))
+        ctk.CTkLabel(delay_row, text="Spawn-Delay (s)", font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     text_color="white", width=150, anchor="w").pack(side="left")
+        self._delay_val_lbl = ctk.CTkLabel(delay_row, text="0.1",
+                                           font=ctk.CTkFont("Segoe UI", 13, "bold"),
+                                           text_color="white", width=36)
+        self._delay_val_lbl.pack(side="right")
+        self._delay_slider = ctk.CTkSlider(
+            delay_row, from_=0.1, to=1.0, number_of_steps=9,  # type: ignore[arg-type]
+            fg_color="#0F3460", progress_color="#1D6FA4", button_color="#4A9ECC",
+            button_hover_color="#6BB8E0",
+            command=self._on_delay_change,
+        )
+        self._delay_slider.set(0.1)
+        self._delay_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
         ctk.CTkFrame(form, fg_color="transparent", height=10).pack()
 
@@ -160,10 +189,10 @@ class KahootApp(ctk.CTk):
         stats_frame.pack(fill="x", padx=24, pady=(10, 0))
 
         for col, (label, attr, color) in enumerate([
-            ("Prozesse",  "_stat_proc_lbl",     "#8892A4"),
-            ("✅ Gejoint", "_stat_joined_lbl",   "#4ADE80"),
-            ("❌ Rejected","_stat_rejected_lbl", "#E8553E"),
-            ("⚠ Fehler",  "_stat_errors_lbl",   "#FACC15"),
+            ("Prozesse",   "_stat_proc_lbl",     "#8892A4"),
+            ("✅ Gejoint",  "_stat_joined_lbl",   "#4ADE80"),
+            ("❌ Rejected", "_stat_rejected_lbl", "#E8553E"),
+            ("⚠ Fehler",   "_stat_errors_lbl",   "#FACC15"),
         ]):
             cell = ctk.CTkFrame(stats_frame, fg_color="transparent")
             cell.grid(row=0, column=col, padx=12, pady=8, sticky="ew")
@@ -188,17 +217,19 @@ class KahootApp(ctk.CTk):
         self._log._textbox.tag_configure("ok",   foreground="#4ADE80")
         self._log._textbox.tag_configure("warn", foreground="#FACC15")
         self._log._textbox.tag_configure("err",  foreground="#E8553E")
-        
-        # ── Footer (Version / Creator) ──────────────────────────────────────────────
-        footer = ctk.CTkLabel(
+
+        # ── Footer ────────────────────────────────────────────────────────────
+        ctk.CTkLabel(
             self,
-            text="KaFlood v1.0 • by Roeppli",
+            text="KaFlood v1.1.0 • by Roeppli",
             font=ctk.CTkFont("Segoe UI", 10),
             text_color="#8892A4"
-        )
-        footer.pack()
+        ).pack()
 
     # ── Hilfsmethoden ─────────────────────────────────────────────────────────
+
+    def _on_delay_change(self, value: float):
+        self._delay_val_lbl.configure(text=f"{value:.1f}")
 
     def _log_msg(self, text: str, tag: str = ""):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -206,7 +237,7 @@ class KahootApp(ctk.CTk):
         self._log._textbox.insert("end", f"[{ts}]  {text}\n", tag)
         self._log._textbox.see("end")
         self._log.configure(state="disabled")
-    
+
     def _clear_log(self):
         self._log.configure(state="normal")
         self._log.delete("1.0", "end")
@@ -220,7 +251,6 @@ class KahootApp(ctk.CTk):
         self._stat_errors_lbl.configure(text=str(self._stat_errors))
 
     def _poll_queue(self):
-        """Liest Queue-Nachrichten aus den Worker-Prozessen."""
         try:
             while True:
                 kind, detail = self._q.get_nowait()
@@ -252,22 +282,19 @@ class KahootApp(ctk.CTk):
         try:
             n_proc = int(self._proc_var.get())
             n_conc = int(self._conc_var.get())
-            delay  = float(self._delay_var.get())
-            assert n_proc >= 1 and n_conc >= 1 and delay >= 0
+            delay  = round(self._delay_slider.get(), 1)
+            assert n_proc >= 1 and n_conc >= 1
         except Exception:
             self._log_msg("⚠ Ungültige Konfiguration.", "warn"); return
-        
+
         self._clear_log()
-        
         self._join_btn.configure(state="disabled")
         self._leave_btn.configure(state="normal")
         self._processes.clear()
 
-        # Stats zurücksetzen
         self._stat_joined = self._stat_rejected = self._stat_errors = 0
         self._update_stats()
 
-        # Alte Queue leeren
         while not self._q.empty():
             try: self._q.get_nowait()
             except: break

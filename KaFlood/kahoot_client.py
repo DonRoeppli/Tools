@@ -1,7 +1,3 @@
-"""
-kahoot_client.py – eigene Kahoot-Library ohne aiocometd.
-Protokoll verifiziert mit Debug-Output.
-"""
 import asyncio
 import json
 import time
@@ -44,7 +40,12 @@ class KahootClient:
     def __init__(self, on_event=None):
         self._on_event = on_event
 
-    async def join(self, pin: int, username: str) -> None:
+    async def _fetch_namerator_name(self) -> str:
+        async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as http:
+            r = await http.get("https://apis.kahoot.it/namerator")
+            return r.json()["name"]
+
+    async def join(self, pin: int, username: str) -> str:
         # ── 1. Session-ID ─────────────────────────────────────────────────────
         with httpx.Client(headers={"User-Agent": USER_AGENT}) as http:
             r = http.get(
@@ -52,8 +53,16 @@ class KahootClient:
             )
             if r.status_code == 404 or r.text == "Not found":
                 raise ValueError(f"Spiel {pin} nicht gefunden.")
-            session_token = r.headers["x-kahoot-session-token"]
-            session_id    = solve_challenge(session_token, r.json()["challenge"])
+            if r.status_code != 200:
+                raise ConnectionError(f"Session-Anfrage fehlgeschlagen: HTTP {r.status_code}")
+            session_data     = r.json()
+            session_token    = r.headers["x-kahoot-session-token"]
+            session_id       = solve_challenge(session_token, session_data["challenge"])
+            namerator_active = session_data.get("namerator", False)
+
+        # ── 2. Namerator-Name holen (falls aktiviert) ─────────────────────────
+        if namerator_active:
+            username = await self._fetch_namerator_name()
 
         ws_url = f"wss://play.kahoot.it/cometd/{pin}/{session_id}"
 
@@ -66,11 +75,13 @@ class KahootClient:
         ) as session:
             async with session.ws_connect(ws_url, ssl=True) as ws:
 
+                pending: list[dict] = []
+
                 async def send_recv(msg: dict) -> dict:
-                    """Sendet eine Nachricht und wartet auf die passende Antwort (per id)."""
+                    """Sendet eine Nachricht und wartet auf die passende Antwort (per id).
+                    Nicht passende Nachrichten (z.B. Heartbeats) werden gepuffert."""
                     target_id = msg["id"]
                     await ws.send_json([msg])
-                    # Lese Nachrichten bis wir die passende id-Antwort bekommen
                     while True:
                         raw = await asyncio.wait_for(ws.receive(), timeout=10)
                         if raw.type != aiohttp.WSMsgType.TEXT:
@@ -78,6 +89,8 @@ class KahootClient:
                         for m in json.loads(raw.data):
                             if m.get("id") == target_id:
                                 return m
+                            else:
+                                pending.append(m)
 
                 # ── 3. Handshake ───────────────────────────────────────────────
                 resp      = await send_recv({
@@ -106,7 +119,18 @@ class KahootClient:
                         "id":           nid(),
                     })
 
-                # ── 6. Login ──────────────────────────────────────────────
+                # ── Gepufferte Heartbeats beantworten ─────────────────────────
+                for m in pending:
+                    if m.get("channel") == "/meta/connect":
+                        await ws.send_json([{
+                            "channel":        "/meta/connect",
+                            "clientId":       client_id,
+                            "connectionType": "websocket",
+                            "id":             nid(),
+                        }])
+                pending.clear()
+
+                # ── 6. Login ───────────────────────────────────────────────────
                 await ws.send_json([{
                     "channel":  "/service/controller",
                     "clientId": client_id,
@@ -119,7 +143,8 @@ class KahootClient:
                             "device": {
                                 "userAgent": USER_AGENT,
                                 "screen": {"width": 1920, "height": 1080},
-                            }
+                            },
+                            "usingNamerator": namerator_active,
                         }),
                     },
                     "id": nid(),
@@ -131,7 +156,6 @@ class KahootClient:
                         for msg in json.loads(raw.data):
                             channel = msg.get("channel", "")
 
-                            # Heartbeat: Server sendet /meta/connect → wir antworten
                             if channel == "/meta/connect":
                                 await ws.send_json([{
                                     "channel":        "/meta/connect",
@@ -141,7 +165,6 @@ class KahootClient:
                                 }])
                                 continue
 
-                            # Nach loginResponse: Bestätigung senden (Fehler über on_event)
                             data = msg.get("data", {})
                             if isinstance(data, dict) and data.get("type") == "loginResponse":
                                 if not data.get("error"):
@@ -153,7 +176,7 @@ class KahootClient:
                                             "type":    "message",
                                             "host":    "kahoot.it",
                                             "gameid":  pin,
-                                            "content": json.dumps({"usingNamerator": False}),
+                                            "content": json.dumps({"usingNamerator": namerator_active}),
                                         },
                                         "id": nid(),
                                     }])
@@ -162,6 +185,8 @@ class KahootClient:
                                       aiohttp.WSMsgType.ERROR,
                                       aiohttp.WSMsgType.CLOSED):
                         break
+
+        return username
 
     async def _dispatch(self, msg: dict) -> None:
         if not self._on_event:

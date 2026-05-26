@@ -4,7 +4,7 @@ A collection of miscellaneous utility tools for different applications, develope
 
 ## Downloads
 
-All compiled versions are available under the Releases section.
+All compiled versions are available in the [Releases](../../releases) section.
 
 ## Disclaimer
 

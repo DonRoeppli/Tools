@@ -30,6 +30,23 @@ def solve_challenge(session_token: str, challenge_js: str) -> str:
     inp    = text.split("this, '")[1].split("'")[0]
     return _xor(session_token, _decode(offset, inp))
 
+# ── Namerator-Pool ────────────────────────────────────────────────────────────
+
+_name_pool: asyncio.Queue = asyncio.Queue()
+
+async def prefetch_names(count: int) -> None:
+    """Holt `count` Namen parallel vom Namerator und füllt den Pool."""
+    async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as http:
+        tasks = [http.get("https://apis.kahoot.it/namerator") for _ in range(count)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            try:
+                await _name_pool.put(r.json()["name"])  # type: ignore[union-attr]
+            except Exception:
+                pass
+
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class KahootClient:
@@ -41,9 +58,13 @@ class KahootClient:
         self._on_event = on_event
 
     async def _fetch_namerator_name(self) -> str:
-        async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as http:
-            r = await http.get("https://apis.kahoot.it/namerator")
-            return r.json()["name"]
+        try:
+            return _name_pool.get_nowait()
+        except asyncio.QueueEmpty:
+            # Fallback: einzeln holen falls Pool leer
+            async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as http:
+                r = await http.get("https://apis.kahoot.it/namerator")
+                return r.json()["name"]
 
     async def join(self, pin: int, username: str) -> str:
         # ── 1. Session-ID ─────────────────────────────────────────────────────
@@ -53,8 +74,6 @@ class KahootClient:
             )
             if r.status_code == 404 or r.text == "Not found":
                 raise ValueError(f"Spiel {pin} nicht gefunden.")
-            if r.status_code != 200:
-                raise ConnectionError(f"Session-Anfrage fehlgeschlagen: HTTP {r.status_code}")
             session_data     = r.json()
             session_token    = r.headers["x-kahoot-session-token"]
             session_id       = solve_challenge(session_token, session_data["challenge"])

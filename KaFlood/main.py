@@ -5,7 +5,7 @@ import os
 import sys
 import customtkinter as ctk
 from datetime import datetime
-from kahoot_client import KahootClient
+from kahoot_client import KahootClient, prefetch_names
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -51,9 +51,9 @@ def worker_process(pin: int, name_prefix: str, start_index: int,
             except Exception as e:
                 if not joined:
                     if attempt == 2:
-                        q.put(("error", f"{type(e).__name__}: {e}" or type(e).__name__))
+                        q.put(("error", str(e)))
                     else:
-                        await asyncio.sleep(1 + attempt)
+                        await asyncio.sleep(1)
 
         await asyncio.sleep(max(spawn_delay, 0.5))
 
@@ -221,7 +221,7 @@ class KahootApp(ctk.CTk):
         # ── Footer ────────────────────────────────────────────────────────────
         ctk.CTkLabel(
             self,
-            text="KaFlood v1.1.0 • by Roeppli",
+            text="KaFlood v1.1.1 • by Roeppli",
             font=ctk.CTkFont("Segoe UI", 10),
             text_color="#8892A4"
         ).pack()
